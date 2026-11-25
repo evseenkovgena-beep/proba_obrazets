@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Живое фото (AR)</title>
+<!--
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  ЭТОТ ФАЙЛ МЕНЯТЬ НЕ НУЖНО.                                          ║
+  ║  Положите рядом с ним файлы с ТОЧНО такими именами:                  ║
+  ║      photo.jpg    — фотография, которую распечатали на листе A4      ║
+  ║      video.mp4    — видео, которое «оживит» эту фотографию           ║
+  ║      targets.mind — метка для распознавания (сделайте в compile.html)║
+  ║  Если targets.mind нет — страница создаст её сама прямо в телефоне   ║
+  ║  (первый запуск будет дольше: 15–40 секунд).                         ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+-->
+<script src="https://cdn.jsdelivr.net/npm/aframe@1.5.0/dist/aframe-master.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+<style>
+  /* ВАЖНО: фон задаём ТОЛЬКО на html.
+     MindAR вставляет <video> с камерой в <body> с z-index:-2.
+     Если у body есть свой непрозрачный background — он рисуется ПОВЕРХ этого
+     видео (body не создаёт stacking context), и мы видим чёрный экран. */
+  html { margin:0; padding:0; height:100%; width:100%; background:#000; overflow:hidden; }
+  body { margin:0; padding:0; height:100%; width:100%; overflow:hidden;
+         background:transparent;
+         font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; color:#fff; }
+  a-scene { width:100%; height:100%; background:transparent !important; }
+  a-scene .a-canvas { background:transparent !important; }
+  /* видео камеры, которое создаёт MindAR (прямой потомок body) */
+  body > video { object-fit:cover; }
+
+  /* ---------- экран загрузки ---------- */
+  #boot {
+    position:fixed; inset:0; z-index:50; background:#0f1020;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    text-align:center; padding:24px; gap:14px;
+  }
+  #boot .t { font-size:19px; font-weight:600; }
+  #boot .s { font-size:15px; color:#a9adce; max-width:320px; }
+  #bar { width:min(280px,70vw); height:8px; border-radius:99px; background:#2a2d4d; overflow:hidden; }
+  #bar i { display:block; height:100%; width:0%; background:#5b5ff0; transition:width .25s ease; }
+
+  /* ---------- подсказка «наведите на фото» ---------- */
+  #scanning { position:fixed; inset:0; z-index:20; pointer-events:none; }
+  #scanning.hidden { display:none; }
+  #scanning .frame {
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    /* размер задаётся из JS по реальным пропорциям photo.jpg (см. fitFrame) */
+    width:58vw; height:calc(58vw * 1.414);
+    border:3px solid rgba(255,255,255,.9); border-radius:10px;
+    box-shadow:0 0 0 100vmax rgba(0,0,0,.35);
+    animation:breathe 2s ease-in-out infinite;
+  }
+  @keyframes breathe { 0%,100%{opacity:.55} 50%{opacity:1} }
+  #scanning .cap {
+    position:absolute; left:0; right:0; bottom:calc(46px + env(safe-area-inset-bottom));
+    text-align:center; padding:0 20px; font-size:17px; font-weight:600;
+    text-shadow:0 1px 8px rgba(0,0,0,.95);
+  }
+
+  /* ---------- нижняя подсказка про звук ---------- */
+  #hint {
+    position:fixed; left:0; right:0; bottom:calc(16px + env(safe-area-inset-bottom));
+    z-index:46; text-align:center; padding:0 16px; font-weight:600;
+    text-shadow:0 1px 6px rgba(0,0,0,.9); pointer-events:none; display:none;
+  }
+  #hint b { color:#ffd54a; }
+
+  /* ---------- кнопка «без AR» ---------- */
+  #plainBtn {
+    position:fixed; z-index:30; right:12px; top:calc(12px + env(safe-area-inset-top));
+    background:rgba(0,0,0,.55); color:#fff; border:1px solid rgba(255,255,255,.35);
+    border-radius:999px; padding:9px 14px; font-size:14px; font-weight:600;
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px); display:none;
+  }
+
+  /* ---------- обычный режим (без камеры) ---------- */
+  #plain { position:fixed; inset:0; z-index:40; background:#000; display:none; }
+  #plain img, #plain video { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  #plain img { z-index:1; } #plain video { z-index:2; }
+  #err { position:fixed; inset:0; z-index:45; background:#0f1020; display:none;
+         flex-direction:column; align-items:center; justify-content:center; gap:12px; text-align:center; padding:26px; }
+  #err .s { color:#a9adce; font-size:15px; max-width:340px; }
+</style>
+</head>
+<body>
+
+<!-- загрузка -->
+<div id="boot">
+  <div class="t">Готовим дополненную реальность…</div>
+  <div id="bar"><i></i></div>
+  <div class="s" id="bootMsg">Разрешите доступ к камере, когда телефон спросит.</div>
+</div>
+
+<!-- подсказка при поиске фото -->
+<div id="scanning" class="hidden">
+  <div class="frame"></div>
+  <div class="cap">📄 Наведите камеру на фотографию<br>(лист A4 целиком в кадре)</div>
+</div>
+
+<div id="hint">🔊 Коснитесь экрана, чтобы включить звук</div>
+<button id="plainBtn">📱 Без камеры</button>
+
+<!-- запасной режим: просто фото + видео -->
+<div id="plain">
+  <img id="pImg" src="photo.jpg" alt="">
+  <video id="pVid" src="video.mp4" poster="photo.jpg" autoplay muted loop playsinline preload="auto"></video>
+</div>
+
+<div id="err">
+  <div class="t" style="font-size:19px;font-weight:600">Камера недоступна</div>
+  <div class="s" id="errMsg"></div>
+</div>
+
+<script>
+/* =====================================================================
+   НАСТРОЙКИ (менять не обязательно)
+   ===================================================================== */
+var CFG = {
+  photo  : 'photo.jpg',      // фотография (она же — метка для распознавания)
+  video  : 'video.mp4',      // видео
+  target : 'targets.mind',   // файл метки (если нет — создастся автоматически)
+
+  // как видео ложится на фотографию:
+  //   'cover'   — заполняет весь лист A4, лишнее по краям обрезается (по умолчанию)
+  //   'contain' — видео целиком, по краям остаётся видна фотография
+  //   'stretch' — растянуть видео точно по листу (пропорции исказятся)
+  fit    : 'cover',
+
+  pauseWhenLost : true,      // пауза, когда фото ушло из кадра
+  cacheTarget   : true,      // запоминать созданную метку в телефоне
+
+  // --- распознавание под углом (фото лежит на столе) ---
+  camWidth  : 1920,          // просим у камеры высокое разрешение: под углом
+  camHeight : 1080,          // мелкие детали «схлопываются», и 640x480 не хватает
+  missTolerance   : 20,      // сколько кадров можно «не видеть» фото, не теряя его
+  warmupTolerance : 1,       // сколько кадров нужно, чтобы принять находку (меньше = быстрее ловит)
+  compileMaxWidth : 1600,    // разрешение метки при сборке в телефоне (было 1200)
+
+  // наклон видео относительно плоскости фотографии, в градусах.
+  // 0 = видео лежит ровно на фото (нормальный режим).
+  // -45 = видео «приподнимается» над лежащим на столе фото на 45°.
+  tiltDeg : 0
+};
+/* ===================================================================== */
+
+var boot     = document.getElementById('boot');
+var bootMsg  = document.getElementById('bootMsg');
+var bar      = document.querySelector('#bar i');
+var scanning = document.getElementById('scanning');
+var hint     = document.getElementById('hint');
+var plainBtn = document.getElementById('plainBtn');
+var plain    = document.getElementById('plain');
+var errBox   = document.getElementById('err');
+var errMsg   = document.getElementById('errMsg');
+
+var arScene = null;        // <a-scene> с дополненной реальностью
+var arVideo = null;        // <video> внутри AR-сцены
+var loud    = false;
+var started = false;
+
+/* ---------- 0a. Просим у камеры высокое разрешение ----------
+   MindAR запрашивает только facingMode:'environment' — браузер часто даёт
+   640x480. Этого хватает «в лоб», но не хватает под углом 30–50°.
+   Перехватываем запрос и добавляем желаемое разрешение + автофокус.     */
+(function upgradeCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = function (c) {
+    try {
+      if (c && c.video) {
+        var base = (c.video === true) ? {} : c.video;
+        c = Object.assign({}, c, { video: Object.assign({}, base, {
+          facingMode : { ideal: 'environment' },
+          width      : { ideal: CFG.camWidth  },
+          height     : { ideal: CFG.camHeight },
+          frameRate  : { ideal: 30 },
+          advanced   : [{ focusMode: 'continuous' }]
+        })});
+      }
+    } catch (e) {}
+    return orig(c).catch(function () {
+      // если телефон не умеет такое разрешение — откатываемся к простому запросу
+      return orig({ audio: false, video: { facingMode: 'environment' } });
+    });
+  };
+})();
+
+/* ---------- 0b. Рамка-подсказка по реальным пропорциям фотографии ---------- */
+function fitFrame(aspect) {           // aspect = высота / ширину фотографии
+  var f = document.querySelector('#scanning .frame');
+  var cap = document.querySelector('#scanning .cap');
+  function apply() {
+    var maxW = window.innerWidth  * (aspect >= 1 ? 0.62 : 0.88);
+    var maxH = window.innerHeight * (aspect >= 1 ? 0.66 : 0.60);
+    var w = maxW, h = w * aspect;
+    if (h > maxH) { h = maxH; w = h / aspect; }
+    f.style.width  = Math.round(w) + 'px';
+    f.style.height = Math.round(h) + 'px';
+  }
+  apply();
+  window.addEventListener('resize', apply);
+  window.addEventListener('orientationchange', function () { setTimeout(apply, 300); });
+  if (cap) cap.innerHTML = '📄 Наведите камеру на фотографию<br>(лист ' +
+    (aspect >= 1 ? 'вертикально' : 'горизонтально') + ', целиком в кадре)';
+}
+
+function progress(p, text) {
+  bar.style.width = Math.max(0, Math.min(100, p)) + '%';
+  if (text) bootMsg.textContent = text;
+}
+
+/* ---------- 1. Узнаём пропорции фотографии (A4 = 1 : 1.414) ---------- */
+function loadPhoto() {
+  return new Promise(function (resolve) {
+    var img = new Image();
+    img.onload  = function () { resolve(img); };
+    img.onerror = function () { resolve(null); };
+    img.src = CFG.photo;
+  });
+}
+
+/* ---------- 2. Берём готовый targets.mind, если он лежит рядом ---------- */
+function fetchTarget() {
+  return fetch(CFG.target, { cache: 'no-cache' })
+    .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+    .then(function (buf) {
+      if (!buf || buf.byteLength < 1000) return null;
+      // защита от «страницы 404», которую некоторые хостинги отдают со статусом 200
+      var head = new Uint8Array(buf.slice(0, 1))[0];
+      if (head === 60) return null; // символ '<'
+      return URL.createObjectURL(new Blob([buf]));
+    })
+    .catch(function () { return null; });
+}
+
+/* ---------- 3. Кэш уже собранной метки ---------- */
+function cacheKey(img) { return 'mindar:' + location.pathname + ':' + img.naturalWidth + 'x' + img.naturalHeight; }
+
+function cacheGet(key) {
+  if (!CFG.cacheTarget) return null;
+  try {
+    var b64 = localStorage.getItem(key);
+    if (!b64) return null;
+    var bin = atob(b64), arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([arr]));
+  } catch (e) { return null; }
+}
+
+function cacheSet(key, buffer) {
+  if (!CFG.cacheTarget) return;
+  try {
+    var arr = new Uint8Array(buffer), s = '';
+    for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+    localStorage.setItem(key, btoa(s));
+  } catch (e) { /* не влезло в память — не страшно */ }
+}
+
+/* ---------- 4. Собираем метку прямо в браузере ---------- */
+function compile(img) {
+  progress(5, 'Первый запуск: изучаем фотографию… Это 15–40 секунд, не закрывайте страницу.');
+  // уменьшаем большое фото — так быстрее, а распознаётся так же
+  var maxW = CFG.compileMaxWidth || 1200;
+  var k = Math.min(1, maxW / img.naturalWidth);
+  var src = document.createElement('canvas');
+  src.width  = Math.round(img.naturalWidth  * k);
+  src.height = Math.round(img.naturalHeight * k);
+  src.getContext('2d').drawImage(img, 0, 0, src.width, src.height);
+  var compiler = new window.MINDAR.IMAGE.Compiler();
+  return compiler.compileImageTargets([src], function (p) { progress(5 + p * 0.9); })
+    .then(function () { return compiler.exportData(); })
+    .then(function (buffer) {
+      cacheSet(cacheKey(img), buffer);
+      return URL.createObjectURL(new Blob([buffer]));
+    });
+}
+
+/* ---------- 5. Запуск AR ---------- */
+function startAR(targetUrl, photoAspect) {
+  var scene = document.createElement('a-scene');
+  scene.setAttribute('embedded', '');
+  scene.setAttribute('color-space', 'sRGB');
+  // в A-Frame свойства компонента разделяются ТОЧКОЙ С ЗАПЯТОЙ, а не запятой
+  scene.setAttribute('renderer', 'colorManagement: true; physicallyCorrectLights: true; alpha: true');
+  scene.setAttribute('vr-mode-ui', 'enabled: false');
+  scene.setAttribute('device-orientation-permission-ui', 'enabled: false');
+  scene.setAttribute('mindar-image',
+    'imageTargetSrc: ' + targetUrl +
+    '; maxTrack: 1' +
+    '; uiScanning: #scanning; uiLoading: no; uiError: no' +
+    '; filterMinCF: 0.0001; filterBeta: 0.005' +
+    '; missTolerance: ' + CFG.missTolerance +
+    '; warmupTolerance: ' + CFG.warmupTolerance);
+
+  scene.innerHTML =
+    '<a-assets>' +
+      '<video id="arvid" src="' + CFG.video + '" preload="auto" loop muted ' +
+             'playsinline webkit-playsinline></video>' +
+    '</a-assets>' +
+    '<a-camera position="0 0 0" look-controls="enabled: false" cursor="fuse: false"></a-camera>' +
+    '<a-entity id="anchor" mindar-image-target="targetIndex: 0">' +
+      // наклон происходит вокруг НИЖНЕГО края фотографии
+      '<a-entity id="tilt" position="0 ' + ((CFG.tiltDeg ? -photoAspect / 2 : 0).toFixed(4)) +
+               ' 0" rotation="' + (CFG.tiltDeg || 0) + ' 0 0">' +
+        '<a-video id="screen" src="#arvid" width="1" height="' + photoAspect.toFixed(4) + '" ' +
+                 'position="0 ' + ((CFG.tiltDeg ? photoAspect / 2 : 0).toFixed(4)) + ' 0" ' +
+                 'rotation="0 0 0"></a-video>' +
+      '</a-entity>' +
+    '</a-entity>';
+
+  document.body.appendChild(scene);
+  arScene = scene;
+
+  scene.addEventListener('arError', function () {
+    showError('Не удалось включить камеру. Разрешите доступ к камере в настройках браузера — ' +
+              'или посмотрите фото и видео без дополненной реальности.');
+  });
+
+  scene.addEventListener('arReady', function () {
+    boot.style.display = 'none';
+    plainBtn.style.display = '';
+  });
+
+  var anchor = scene.querySelector('#anchor');
+  var screen = scene.querySelector('#screen');
+  arVideo = scene.querySelector('#arvid');
+
+  // если видео не открылось — показываем на метке саму фотографию
+  arVideo.addEventListener('error', function () {
+    screen.setAttribute('src', CFG.photo);
+    hint.innerHTML = '🎬 Положите в эту папку файл <b>video.mp4</b> — и фото оживёт';
+    hint.style.display = '';
+  });
+
+  arVideo.addEventListener('loadedmetadata', function () {
+    fitVideo(screen, photoAspect, arVideo.videoWidth, arVideo.videoHeight);
+  });
+
+  anchor.addEventListener('targetFound', function () {
+    if (!loud) hint.style.display = '';
+    var p = arVideo.play();
+    if (p && p.catch) p.catch(function () {});
+  });
+
+  anchor.addEventListener('targetLost', function () {
+    hint.style.display = 'none';
+    if (CFG.pauseWhenLost) arVideo.pause();
+  });
+
+  started = true;
+}
+
+/* ---------- 6. Вписываем видео в лист A4 ---------- */
+function fitVideo(screen, planeH, vw, vh) {
+  if (!vw || !vh) return;
+  var planeAspect = 1 / planeH;      // ширина / высота листа
+  var videoAspect = vw / vh;
+
+  if (CFG.fit === 'contain') {
+    var w = 1, h = planeH;
+    if (videoAspect > planeAspect) { w = 1; h = 1 / videoAspect; }
+    else                           { h = planeH; w = planeH * videoAspect; }
+    screen.setAttribute('width',  w.toFixed(4));
+    screen.setAttribute('height', h.toFixed(4));
+    return;
+  }
+  if (CFG.fit === 'stretch') return;  // плоскость уже равна листу A4
+
+  // 'cover' — заполняем лист, лишнее обрезаем средствами текстуры
+  var rx = 1, ry = 1, ox = 0, oy = 0;
+  if (videoAspect > planeAspect) { rx = planeAspect / videoAspect; ox = (1 - rx) / 2; }
+  else                           { ry = videoAspect / planeAspect; oy = (1 - ry) / 2; }
+
+  var tries = 0;
+  (function apply() {
+    var mesh = screen.getObject3D('mesh');
+    var map  = mesh && mesh.material && mesh.material.map;
+    if (!map) { if (tries++ < 60) return setTimeout(apply, 100); return; }
+    map.repeat.set(rx, ry);
+    map.offset.set(ox, oy);
+    map.needsUpdate = true;
+    mesh.material.needsUpdate = true;
+  })();
+}
+
+/* ---------- 7. Звук по касанию ---------- */
+function goLoud() {
+  if (loud) return;
+  var v = arVideo || document.getElementById('pVid');
+  if (!v) return;
+  loud = true;
+  v.muted = false;
+  var p = v.play();
+  if (p && p.catch) p.catch(function () { loud = false; });
+  hint.style.display = 'none';
+}
+document.addEventListener('click', goLoud);
+document.addEventListener('touchstart', goLoud, { passive: true });
+
+/* ---------- 8. Режим без камеры ---------- */
+function showPlain() {
+  // выключаем камеру, если AR уже запустилась
+  if (arScene) {
+    try { arScene.systems['mindar-image-system'].stop(); } catch (e) {}
+    arScene.style.display = 'none';
+  }
+  plain.style.display = 'block';
+  boot.style.display = 'none';
+  errBox.style.display = 'none';
+  scanning.classList.add('hidden');
+  plainBtn.style.display = 'none';
+  var pv = document.getElementById('pVid');
+  arVideo = null;
+  loud = false;
+  hint.innerHTML = '🔊 Коснитесь экрана, чтобы включить звук';
+  hint.style.display = '';
+  var p = pv.play(); if (p && p.catch) p.catch(function () {});
+  pv.addEventListener('error', function () { pv.style.display = 'none'; hint.style.display = 'none'; });
+}
+plainBtn.addEventListener('click', function (e) { e.stopPropagation(); showPlain(); });
+
+function showError(text) {
+  boot.style.display = 'none';
+  errBox.style.display = 'flex';
+  errMsg.innerHTML = text + '<br><br><button id="toPlain" style="background:#5b5ff0;color:#fff;border:0;' +
+                     'border-radius:12px;padding:13px 20px;font-size:16px;font-weight:600">' +
+                     'Смотреть без камеры</button>';
+  document.getElementById('toPlain').addEventListener('click', function (e) { e.stopPropagation(); showPlain(); });
+}
+
+/* ---------- 9. Поехали ---------- */
+(function main() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext) {
+    showError('Браузер не даёт доступ к камере: нужна ссылка, которая начинается с <b>https://</b> ' +
+              '(например, адрес GitHub Pages).');
+    return;
+  }
+
+  loadPhoto().then(function (img) {
+    if (!img) {
+      showError('Не найден файл <b>photo.jpg</b>. Положите фотографию рядом с этой страницей.');
+      return null;
+    }
+    // высота листа относительно ширины: A4 вертикально = 1.414, A4 горизонтально = 0.707
+    var aspect = img.naturalHeight / img.naturalWidth;
+    fitFrame(aspect);          // рамка-подсказка принимает форму реальной фотографии
+
+    return fetchTarget().then(function (url) {
+      if (url) return { url: url, aspect: aspect };
+      var cached = cacheGet(cacheKey(img));
+      if (cached) return { url: cached, aspect: aspect };
+      return compile(img).then(function (u) { return { url: u, aspect: aspect }; });
+    });
+  }).then(function (res) {
+    if (!res) return;
+    progress(100, 'Включаем камеру…');
+    startAR(res.url, res.aspect);
+  }).catch(function (e) {
+    showError('Что-то пошло не так при подготовке метки. Попробуйте сделать файл ' +
+              '<b>targets.mind</b> на странице compile.html и положить его рядом с фотографией.');
+    console.error(e);
+  });
+
+  // если за 25 секунд AR так и не поднялся — предложим обычный режим
+  setTimeout(function () {
+    if (!started && boot.style.display !== 'none') plainBtn.style.display = '';
+  }, 25000);
+})();
+</script>
+</body>
+</html>
